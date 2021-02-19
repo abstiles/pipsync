@@ -5,8 +5,20 @@ import logging
 import os
 import re
 import subprocess
+from dataclasses import dataclass, field, InitVar
 from functools import lru_cache, cached_property
 from pathlib import Path
+from typing import (
+    Any,
+    Iterator,
+    List,
+    Dict,
+    Mapping,
+    Iterable,
+    ClassVar,
+    Pattern,
+    Union,
+)
 
 import toml
 
@@ -22,39 +34,79 @@ __description__ = "Sync requirements.txt files with a project Pipfile."
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class Requirement:
+    """Structured requirement model"""
+
+    git_parser: ClassVar[Pattern[str]] = re.compile(
+        r"^(?:-e )?git\+.*#egg=(?P<package>.*)$"
+    )
+
+    package_name: str
+    requirement_line: str
+
+    @classmethod
+    def parse_requirement_line(cls, requirement_line: str) -> "Requirement":
+        """Create a Requirement object from a line of a requirements.txt file"""
+        if git_repo := cls.git_parser.match(requirement_line):
+            name = git_repo["package"].rstrip("\n")
+        else:
+            name = requirement_line.rstrip("\n").split("==")[0]
+        return cls(name, requirement_line.rstrip("\n"))
+
+    @classmethod
+    def from_data(
+        cls, package_name: str, package_data: Dict[str, Any]
+    ) -> "Requirement":
+        """Create a Requirement object from a Pipfile.lock package entry"""
+
+        if version := package_data.get("version"):
+            return cls(package_name, f"{package_name}{version}")
+
+        # Git installed packages will not have version values
+        if git_url := package_data.get("git"):
+            prefix = "-e " if package_data.get("editable") else ""
+            ref = f"@{git_ref}" if (git_ref := package_data.get("ref")) else ""
+            return cls(package_name, f"{prefix}git+{git_url}{ref}#egg={package_name}")
+
+        return cls(package_name, package_name)
+
+
 class PackageProcessor:
     """Processor for parsing package dependency data in a pipenv project"""
 
     def __init__(
         self,
-        root: Path,
+        root: Union[str, Path],
         force: bool = False,
         in_place: bool = False,
         include_dev: bool = False,
     ):
         self.root = Path(root).expanduser()
-        self.pipfile = Pipfile(root / "Pipfile")
-        self.pipfile_lock = PipfileLock(root / "Pipfile.lock")
+        self.pipfile = Pipfile(self.root / "Pipfile")
+        self.pipfile_lock = PipfileLock(self.root / "Pipfile.lock")
         self.force = force
         self.in_place = in_place
         self.include_dev = include_dev
 
     @cached_property
-    def graph(self) -> list:
+    def graph(self) -> List[Dict[str, Any]]:
         """Get the dependency graph from pipenv"""
 
-        return json.loads(
-            subprocess.run(
-                ("pipenv", "graph", "--json"),
-                capture_output=True,
-                check=True,
-                text=True,
-                cwd=self.root,
-            ).stdout
-        )
+        return [
+            *json.loads(
+                subprocess.run(
+                    ("pipenv", "graph", "--json"),
+                    capture_output=True,
+                    check=True,
+                    text=True,
+                    cwd=self.root,
+                ).stdout
+            )
+        ]
 
     @cached_property
-    def dependency_map(self) -> dict:
+    def dependency_map(self) -> Dict[str, List[str]]:
         """Get a mapping of package names to package dependencies"""
 
         return {
@@ -64,7 +116,7 @@ class PackageProcessor:
             for dependency in self.graph
         }
 
-    def generate_requirements(self, requirements_list: list) -> list:
+    def generate_requirements(self, requirements_list: List[Requirement]) -> List[str]:
         """Given a list of requirements, generate an updated version"""
 
         requirements = {
@@ -80,7 +132,7 @@ class PackageProcessor:
         else:
             version_map = {**requirements, **self.pipfile_lock.default}
 
-        def generate_dependencies(requirements: set):
+        def generate_dependencies(requirements: Iterable[str]) -> Iterator[str]:
             for requirement in requirements:
                 yield requirement
                 try:
@@ -120,28 +172,28 @@ class PackageProcessor:
 class Pipfile:
     """Parser for a Pipfile"""
 
-    def __init__(self, pipfile_path: Path):
+    def __init__(self, pipfile_path: Union[str, Path]):
         self.path = Path(pipfile_path).expanduser()
         if not is_readable_file(pipfile_path):
             raise ValueError(f"Pipfile not found at path {pipfile_path}")
 
     @lru_cache(maxsize=1)
-    def parse(self):
+    def parse(self) -> Mapping[str, Any]:
         """Get the Pipfile contents"""
         return toml.load(self.path)
 
     @property
-    def default_packages(self) -> dict:
+    def default_packages(self) -> Dict[str, str]:
         """Default package map"""
         return dict(self.parse()["packages"])
 
     @property
-    def dev_packages(self) -> dict:
+    def dev_packages(self) -> Dict[str, str]:
         """Development package map"""
         return dict(self.parse()["dev-packages"])
 
     @property
-    def all_packages(self) -> dict:
+    def all_packages(self) -> Dict[str, str]:
         """Map containing all packages"""
         return {**self.parse()["packages"], **self.parse()["dev-packages"]}
 
@@ -149,19 +201,21 @@ class Pipfile:
 class PipfileLock:
     """Parser for a Pipfile.lock"""
 
-    def __init__(self, pipfile_lock_path: Path):
+    def __init__(self, pipfile_lock_path: Union[str, Path]):
         self.path = Path(pipfile_lock_path).expanduser()
         if not is_readable_file(pipfile_lock_path):
             raise ValueError(f"Pipfile.lock not found at path {pipfile_lock_path}")
 
     @lru_cache(maxsize=1)
-    def parse(self) -> dict:
+    def parse(self) -> Dict[str, Dict[str, Any]]:
         """Get the contents of Pipfile.lock"""
         with open(self.path, "r") as f:
-            return json.load(f)
+            if isinstance(contents := json.load(f), dict):
+                return contents
+            raise ValueError("Unexpected format of Pipfile.lock contents")
 
     @cached_property
-    def default(self) -> dict:
+    def default(self) -> Dict[str, Requirement]:
         """Map of default packages to versioned requirement"""
         return {
             pkg[0]: Requirement.from_data(*pkg)
@@ -169,46 +223,12 @@ class PipfileLock:
         }
 
     @cached_property
-    def dev(self) -> dict:
+    def dev(self) -> Dict[str, Requirement]:
         """Map of develop packages to versioned requirement"""
         return {
             pkg[0]: Requirement.from_data(*pkg)
             for pkg in self.parse()["develop"].items()
         }
-
-
-class Requirement:
-    """Structured requirement model"""
-
-    git_parser = re.compile(r"^(?:-e )?git\+.*#egg=(?P<package>.*)$")
-
-    def __init__(self, package_name: str, requirement_line: str):
-        self.package_name = package_name
-        self.requirement_line = requirement_line
-
-    @classmethod
-    def parse_requirement_line(cls, requirement_line: str) -> "Requirement":
-        """Create a Requirement object from a line of a requirements.txt file"""
-        if git_repo := cls.git_parser.match(requirement_line):
-            name = git_repo["package"].rstrip("\n")
-        else:
-            name = requirement_line.rstrip("\n").split("==")[0]
-        return cls(name, requirement_line.rstrip("\n"))
-
-    @classmethod
-    def from_data(cls, package_name: str, package_data: dict) -> "Requirement":
-        """Create a Requirement object from a Pipfile.lock package entry"""
-
-        if version := package_data.get("version"):
-            return cls(package_name, f"{package_name}{version}")
-
-        # Git installed packages will not have version values
-        if git_url := package_data.get("git"):
-            prefix = "-e " if package_data.get("editable") else ""
-            ref = f"@{git_ref}" if (git_ref := package_data.get("ref")) else ""
-            return cls(package_name, f"{prefix}git+{git_url}{ref}#egg={package_name}")
-
-        return cls(package_name, package_name)
 
 
 def detect_root() -> Path:
@@ -282,17 +302,21 @@ def arguments() -> argparse.Namespace:
     return parsed_args
 
 
-def is_readable_file(path: Path) -> bool:
+def is_readable_file(path: Union[str, Path]) -> bool:
     """Returns True iff path is a readable file"""
     return os.path.isfile(path) and os.access(path, os.R_OK)
 
 
-def find_dependency_files(root_dir: Path, name: str, exclude: list) -> list:
+def find_dependency_files(
+    root_dir: Union[str, Path], name: str, exclude: List[Path]
+) -> List[Path]:
     """Get a list of all paths matching name"""
     return [*recursive_search(root_dir, name, exclude)]
 
 
-def recursive_search(root_dir: Path, name: str, exclude: list):
+def recursive_search(
+    root_dir: Union[str, Path], name: str, exclude: List[Path]
+) -> Iterator[Path]:
     """Generate paths to files with the given name"""
 
     for root, dirs, _ in os.walk(root_dir):
