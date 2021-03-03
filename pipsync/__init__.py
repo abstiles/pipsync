@@ -98,24 +98,31 @@ def get_pipfile_packages(base_dir, include_dev=False):
 
     values = dict()
 
-    def get_version(package):
+    def get_version(package, package_db):
         # Git installed packages will not have version values
-        version = pipfile_lock["default"][package].get("version")
+        version = package_db[package].get("version")
 
         if not version:
-            git_url = pipfile_lock["default"][package].get("git")
+            git_url = package_db[package].get("git")
+            git_ref = package_db[package].get("ref")
+            is_editable = package_db[package].get("editable")
             if git_url:
-                return {"pip": f"git+{git_url}#egg={package}"}
+                prefix = '-e ' if is_editable else ''
+                ref = f'@{git_ref}' if git_ref else ''
+                return {"pip": f"{prefix}git+{git_url}{ref}#egg={package}"}
         else:
             return {"pip": f"{package}{version}"}
 
     package_data = dict(pipfile["packages"])
     if include_dev:
         package_data.update(pipfile["dev-packages"])
+    locked_packages = pipfile_lock["default"]
+    if include_dev:
+        locked_packages.update(pipfile_lock["develop"])
 
-    for p in pipfile_lock["default"].keys():
-        if p in package_data.keys():
-            values[p.lower()] = get_version(p)
+    for package_name in locked_packages:
+        if package_name in package_data.keys():
+            values[package_name.lower()] = get_version(package_name, locked_packages)
 
     return values
 
